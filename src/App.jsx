@@ -157,56 +157,113 @@ export default function App() {
   const handleGoogleLogin = () => signInWithPopup(auth, googleProvider).catch(e => alert(e.message));
   const handleLogout = () => signOut(auth);
 
-  // [AI 생성 로직: 듀얼 엔진 및 한국어 강제]
-  const handleGenerate = async () => {
-    if (!isSystemActive || currentUser?.isDisabled) return alert("접근 불가");
-    const requiredPoints = count * 100;
-    if (!isAdmin && !currentUser?.isFree && !currentUser?.isSubscribed && (currentUser?.points || 0) < requiredPoints) {
-        setPaymentNotice(`출제를 위해 포인트가 부족합니다.`);
-        setCurrentView('payment');
-        return;
-    }
+// [AI 생성 로직: 10개 무료 쿼터 + 난이도 랜덤화 + 중복 방지 적용]
+const handleGenerate = async () => {
+  if (!isSystemActive || currentUser?.isDisabled) return alert("현재 시스템을 이용할 수 없습니다.");
 
-    const API_KEY = import.meta.env.VITE_GEMINI_API_KEY;
-    setIsGenerating(true); setQuestions([]); 
-    if (window.innerWidth < 1024) setIsSettingsExpanded(false); 
+  // 1. 일일 무료 쿼터 체크 (로컬 스토리지 기반)
+  const today = new Date().toLocaleDateString();
+  const quotaKey = `quota_${currentUser?.uid}`;
+  const localQuota = JSON.parse(localStorage.getItem(quotaKey) || '{"date":"","count":0}');
+  
+  let isWithinFreeLimit = false;
+  if (localQuota.date !== today) {
+    isWithinFreeLimit = true; // 날짜가 바뀌었으므로 새로 10개 가능
+  } else if (localQuota.count + count <= 10) {
+    isWithinFreeLimit = true; // 오늘 사용량이 아직 10개 미만
+  }
 
-    try {
-      let acc = [];
-      const sub = mode === 'A' ? subjectA : `${subjectB} (${chapter})`;
+  const requiredPoints = count * 100;
+  // 관리자, 무료권자, 구독자, 혹은 오늘 10개 무료 범위 내인 경우 통과
+  const hasAccess = isAdmin || currentUser?.isFree || currentUser?.isSubscribed || isWithinFreeLimit;
+
+  if (!hasAccess && (currentUser?.points || 0) < requiredPoints) {
+      setPaymentNotice(`오늘의 무료 문항(10개)을 모두 사용하셨습니다. 계속하시려면 포인트를 충전해주세요.`);
+      setCurrentView('payment');
+      return;
+  }
+
+  const API_KEY = import.meta.env.VITE_GEMINI_API_KEY;
+  setIsGenerating(true); 
+  setQuestions([]); 
+  if (window.innerWidth < 1024) setIsSettingsExpanded(false); 
+
+  try {
+    let acc = [];
+    const sub = mode === 'A' ? subjectA : `${subjectB} (${chapter})`;
+    
+    while (acc.length < count) {
+      const bSize = Math.min(count - acc.length, 5);
       
-      while (acc.length < count) {
-        const bSize = Math.min(count - acc.length, 5);
-        const prompt = `당신은 응급의학 박사 출제위원입니다. 과목:${sub}, 난이도:${difficulty} 전문 문항 ${bSize}개를 생성하세요. 반드시 모든 텍스트를 '한국어'로 작성하고 다른 대화 없이 [ ]로 감싸진 JSON 배열 형식만 응답하세요. 형식: [{"id":${acc.length+1}, "question":"...", "options":["1","2","3","4","5"], "answer":1, "explanation":"..."}]`;
+      // --- [핵심 수정: 난이도 및 중복 방지 로직] ---
+      let targetDiff = difficulty;
+      let antiDuplication = "";
 
-        let modelName = "gemini-2.5-pro"; 
-        let res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${API_KEY}`, { 
+      if (count < 10) {
+        const randomDiffs = ['기초 핵심', '임상 응용', '심화 추론'];
+        targetDiff = randomDiffs[Math.floor(Math.random() * randomDiffs.length)];
+      }
+
+      if (count <= 3) {
+        const seeds = ["구급 현장 임무", "응급실 대기 상황", "이송 중 악화 상황", "재난 대응"];
+        antiDuplication = `
+          [중복 방지 긴급 지시]: 
+          - 환자의 성별/나이만 바꾸는 형태의 문제 생성을 엄격히 금지함.
+          - '${seeds[Math.floor(Math.random() * seeds.length)]}' 시나리오를 바탕으로 문장 구조를 완전히 새롭게 구성할 것.
+        `;
+      }
+
+      const prompt = `당신은 1급 응급구조사 국가고시 출제위원(응급의학 박사)입니다. 
+        과목: ${sub}, 난이도: ${targetDiff}
+        반드시 딱 ${bSize}개의 문항만 생성하세요.
+        ${antiDuplication}
+        모든 텍스트는 한국어로 작성하고 [ ] JSON 배열 형식만 출력하세요.
+        형식: [{"id":${acc.length+1}, "question":"...", "options":["1","2","3","4","5"], "answer":1, "explanation":"..."}]`;
+
+      let modelName = "gemini-2.5-pro"; 
+      let res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${API_KEY}`, { 
+        method:'POST', headers:{'Content-Type':'application/json'}, 
+        body:JSON.stringify({ contents:[{parts:[{text:prompt}]}] }) 
+      });
+
+      if (!res.ok) {
+        modelName = "gemini-2.5-flash"; // 폴백
+        res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${API_KEY}`, { 
           method:'POST', headers:{'Content-Type':'application/json'}, 
           body:JSON.stringify({ contents:[{parts:[{text:prompt}]}] }) 
         });
-
-        if (!res.ok) {
-          modelName = "gemini-2.5-flash"; // 폴백
-          res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${API_KEY}`, { 
-            method:'POST', headers:{'Content-Type':'application/json'}, 
-            body:JSON.stringify({ contents:[{parts:[{text:prompt}]}] }) 
-          });
-        }
-
-        const data = await res.json();
-        const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
-        const jsonMatch = rawText.match(/\[[\s\S]*\]/);
-        
-        if (jsonMatch) {
-          const batch = JSON.parse(jsonMatch[0]);
-          acc = [...acc, ...batch];
-          setQuestions([...acc.slice(0, count)]);
-        }
-        if (acc.length < count) await new Promise(r => setTimeout(r, 1200)); 
       }
-      if (!isAdmin && !currentUser?.isSubscribed) await updateDoc(doc(db, "users", currentUser.uid), { points: (currentUser.points || 0) - requiredPoints });
-    } catch (e) { alert("AI 서버 지연. 잠시 후 시도하세요."); } finally { setIsGenerating(false); }
-  };
+
+      const data = await res.json();
+      const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+      const jsonMatch = rawText.match(/\[[\s\S]*\]/);
+      
+      if (jsonMatch) {
+        const batch = JSON.parse(jsonMatch[0]);
+        acc = [...acc, ...batch];
+        setQuestions([...acc.slice(0, count)]);
+
+        // 무료 쿼터 카운트 업데이트
+        if (isWithinFreeLimit && !isAdmin && !currentUser?.isSubscribed) {
+          localStorage.setItem(quotaKey, JSON.stringify({
+            date: today,
+            count: (localQuota.date === today ? localQuota.count : 0) + batch.length
+          }));
+        }
+      }
+      if (acc.length < count) await new Promise(r => setTimeout(r, 1200)); 
+    }
+
+    // 포인트 차감 (유료 사용자만)
+    if (!isAdmin && !currentUser?.isSubscribed && !isWithinFreeLimit) {
+      await updateDoc(doc(db, "users", currentUser.uid), { points: (currentUser.points || 0) - requiredPoints });
+    }
+  } catch (e) { 
+    alert("AI 엔진 연동 중 오류가 발생했습니다."); 
+  } finally { 
+    setIsGenerating(false); 
+  }
+};
 
   useEffect(() => {
     if (!isLogged) return;
@@ -371,18 +428,69 @@ export default function App() {
           </div>
         )}
 
-        {currentView === 'payment' && (
+{currentView === 'payment' && (
           <div className="animate-in slide-in-from-bottom-5 duration-700 pb-20 px-2 text-center max-w-5xl mx-auto">
             <h2 className="text-3xl md:text-4xl font-black mb-4 tracking-tighter text-slate-800 uppercase">Premium Plans</h2>
             <p className="text-slate-400 mb-12 font-bold uppercase tracking-widest text-[10px]">Quality Verified by PhD Paramedic</p>
-            {paymentNotice && <div className="mb-10 p-6 bg-red-50 border-2 border-red-200 rounded-3xl flex items-center justify-center gap-4 text-red-600 font-black animate-bounce"><AlertCircle/> {paymentNotice}</div>}
+            
+            {paymentNotice && (
+              <div className="mb-10 p-6 bg-red-50 border-2 border-red-200 rounded-3xl flex items-center justify-center gap-4 text-red-600 font-black animate-bounce">
+                <AlertCircle/> {paymentNotice}
+              </div>
+            )}
+
             <div className="flex flex-col md:flex-row gap-8 md:gap-10">
+                {/* 1. 포인트 충전 카드 */}
                 <div className="flex-1 bg-white p-10 md:p-12 rounded-[40px] md:rounded-[64px] border shadow-sm space-y-8 relative overflow-hidden group text-left text-slate-900">
-                    <Wallet size={48} className="text-blue-600"/><h3 className="text-2xl md:text-3xl font-black tracking-tighter">포인트 충전</h3><div className="space-y-2"><p className="text-slate-400 font-bold text-sm">소량 생성 필요 시</p><p className="text-4xl md:text-5xl font-black">₩ 100 <span className="text-sm font-bold text-slate-300">/ 문항</span></p></div><button onClick={async () => { if(currentUser?.uid) await updateDoc(doc(db, "users", currentUser.uid), { points: (currentUser.points || 0) + 5000 }); alert("Google Pay 5,000원 충전 완료"); }} className="w-full py-5 bg-slate-900 text-white rounded-2xl font-black shadow-lg hover:bg-black transition-all active:scale-95">Google Pay 충전</button>
+                    <Wallet size={48} className="text-blue-600"/>
+                    <h3 className="text-2xl md:text-3xl font-black tracking-tighter">포인트 충전</h3>
+                    <div className="space-y-2">
+                        <p className="text-slate-400 font-bold text-sm">소량 생성 필요 시 (매일 10문항 무료 제공)</p>
+                        <p className="text-4xl md:text-5xl font-black">₩ 5,000 <span className="text-sm font-bold text-slate-300">/ 50문항</span></p>
+                    </div>
+                    <button 
+                      onClick={async () => { 
+                        if(currentUser?.uid) {
+                          // [Google Pay API 연동 시뮬레이션]
+                          try {
+                            const newPoints = (currentUser.points || 0) + 5000;
+                            await updateDoc(doc(db, "users", currentUser.uid), { points: newPoints });
+                            alert("Google Pay 결제가 완료되었습니다. 5,000 포인트가 충전되었습니다.");
+                          } catch (e) {
+                            alert("충전 중 오류가 발생했습니다.");
+                          }
+                        }
+                      }} 
+                      className="w-full py-5 bg-slate-900 text-white rounded-2xl font-black shadow-lg hover:bg-black transition-all active:scale-95"
+                    >
+                      Google Pay로 즉시 충전
+                    </button>
                 </div>
+
+                {/* 2. 무제한 구독 카드 */}
                 <div className="flex-1 bg-white p-10 md:p-12 rounded-[40px] md:rounded-[64px] border-4 border-blue-600 shadow-2xl shadow-blue-100 space-y-8 relative group text-left text-blue-600">
-                    <div className="absolute top-0 right-0 bg-blue-600 text-white px-6 md:px-8 py-3 font-black text-[10px] uppercase rounded-bl-2xl">Verified Best</div>
-                    <Activity size={48}/><h3 className="text-2xl md:text-3xl font-black tracking-tighter">무제한 월 구독</h3><div className="space-y-2"><p className="text-slate-400 font-bold text-sm">국가고시 합격까지 무제한 생성</p><p className="text-4xl md:text-5xl font-black text-blue-600">₩ 19,900 <span className="text-sm font-bold text-slate-300">/ mo</span></p></div><button onClick={async () => { if(currentUser?.uid) await updateDoc(doc(db, "users", currentUser.uid), { isSubscribed: true }); alert("구독 시작!"); }} className="w-full py-5 bg-blue-600 text-white rounded-2xl font-black shadow-lg active:scale-95 transition-all">지금 바로 구독 시작</button>
+                    <div className="absolute top-0 right-0 bg-blue-600 text-white px-6 md:px-8 py-3 font-black text-[10px] uppercase rounded-bl-2xl">합격 보장</div>
+                    <Activity size={48}/>
+                    <h3 className="text-2xl md:text-3xl font-black tracking-tighter">무제한 월 구독</h3>
+                    <div className="space-y-2">
+                        <p className="text-slate-400 font-bold text-sm">국가고시 합격까지 광고 없이 무제한</p>
+                        <p className="text-4xl md:text-5xl font-black text-blue-600">₩ 19,900 <span className="text-sm font-bold text-slate-300">/ mo</span></p>
+                    </div>
+                    <button 
+                      onClick={async () => { 
+                        if(currentUser?.uid) {
+                          try {
+                            await updateDoc(doc(db, "users", currentUser.uid), { isSubscribed: true });
+                            alert("Premium 구독이 시작되었습니다! 이제 모든 기능을 무제한으로 이용하세요.");
+                          } catch (e) {
+                            alert("구독 처리 중 오류가 발생했습니다.");
+                          }
+                        }
+                      }} 
+                      className="w-full py-5 bg-blue-600 text-white rounded-2xl font-black shadow-lg active:scale-95 transition-all"
+                    >
+                      지금 바로 구독 시작
+                    </button>
                 </div>
             </div>
           </div>
